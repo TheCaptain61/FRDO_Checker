@@ -1,0 +1,33 @@
+# Local agent/editor state
+.agents/
+.codex/
+.vscode/
+.idea/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Build output
+build/
+
+# Keep the packaged application, ignore transient files around it.
+dist/*
+!dist/
+!dist/FRDO_Checker.exe
+
+# App runtime/local generated files
+frdo_checker_settings.json
+_bak/
+*.bak
+*.tmp
+*.log
+
+# Generated reports
+frdo_*_report_*.doc
+*.docx
+
+# OS files
+Thumbs.db
+Desktop.ini
