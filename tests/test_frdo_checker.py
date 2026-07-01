@@ -137,6 +137,51 @@ class FrdoCheckerTests(unittest.TestCase):
         self.assertIn(checker.EXPECTED_HEADERS[1], issue_fields)
         self.assertNotIn(checker.EXPECTED_HEADERS[23], issue_fields)
 
+    def test_spo_extra_matrix_rules_for_dates_and_target_fields(self) -> None:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = checker.SHEET_NAME
+        for col, header in enumerate(checker.EXPECTED_HEADERS, start=1):
+            ws.cell(1, col).value = header
+        ws.cell(2, 8).value = "Нет"
+        ws.cell(2, 9).value = "1"
+        ws.cell(2, 10).value = "01.01.2024"
+        ws.cell(2, 29).value = "Да"
+        ws.cell(2, 30).value = "12@"
+        ws.cell(2, 31).value = "02.01.2024"
+        ws.cell(2, 32).value = "ООО @"
+        ws.cell(2, 35).value = "ООО @"
+        ws.cell(2, 43).value = "03.01.2024"
+
+        issues = checker.scan_spo_workbook(Path("sample.xlsx"), wb)
+        messages = [issue.message for issue in issues]
+
+        self.assertIn("Дата договора о целевом обучении позже даты выдачи документа", messages)
+        self.assertIn("Дата выдачи оригинала позже даты выдачи дубликата", messages)
+        self.assertIn("Недопустимые символы в номере договора о целевом обучении", messages)
+        self.assertIn("Недопустимые символы в наименовании организации", messages)
+
+    def test_po_extra_matrix_rules_for_original_document(self) -> None:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = checker.SHEET_NAME
+        for col, header in enumerate(checker.PO_HEADERS, start=1):
+            ws.cell(1, col).value = header
+        ws.cell(2, 1).value = "Свидетельство"
+        ws.cell(2, 2).value = "Дубликат"
+        ws.cell(2, 6).value = "Нет"
+        ws.cell(2, 7).value = "1"
+        ws.cell(2, 8).value = "01.01.2024"
+        ws.cell(2, 27).value = "Свидетельство"
+        ws.cell(2, 29).value = "12A"
+        ws.cell(2, 31).value = "02.01.2024"
+
+        issues = checker.scan_po_workbook(Path("sample.xlsx"), wb)
+        messages = [issue.message for issue in issues]
+
+        self.assertIn("Номер оригинала должен содержать только цифры", messages)
+        self.assertIn("Дата выдачи оригинала позже даты выдачи дубликата", messages)
+
     def test_manual_edit_creates_backup_and_writes_value(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "sample.xlsx"

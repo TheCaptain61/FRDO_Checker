@@ -864,6 +864,7 @@ def scan_spo_workbook(path: Path, workbook=None) -> list[Issue]:
             "Источник финансирования обучения": "Источник финансирования обучения",
             "Наличие договора о целевом обучении": "Наличие договора о целевом обучении",
             "Субъект федерации в котором расположена организация работодатель": "Субъект федерации в котором расположена организация работодатель",
+            "Наименование документа об образовании (оригинала)": "Вид документа",
         }
         for field, ref_name in list_fields.items():
             col = COL[field]
@@ -895,6 +896,28 @@ def scan_spo_workbook(path: Path, workbook=None) -> list[Issue]:
         birth_date = parse_date(ws.cell(row, COL["Дата рождения получателя"]).value)
         if birth_date and not (date(1900, 1, 1) <= birth_date <= date(2100, 12, 31)):
             add_issue(issues, path, row, COL["Дата рождения получателя"], "Дата рождения вне допустимого диапазона 1900-2100", ws.cell(row, COL["Дата рождения получателя"]).value)
+
+        contract_date = parse_date(ws.cell(row, COL["Дата заключения договора о целевом обучении"]).value)
+        if issue_date and contract_date and contract_date > issue_date:
+            add_issue(
+                issues,
+                path,
+                row,
+                COL["Дата заключения договора о целевом обучении"],
+                "Дата договора о целевом обучении позже даты выдачи документа",
+                ws.cell(row, COL["Дата заключения договора о целевом обучении"]).value,
+            )
+
+        original_issue_date = parse_date(ws.cell(row, COL["Дата выдачи (оригинала)"]).value)
+        if issue_date and original_issue_date and original_issue_date > issue_date:
+            add_issue(
+                issues,
+                path,
+                row,
+                COL["Дата выдачи (оригинала)"],
+                "Дата выдачи оригинала позже даты выдачи дубликата",
+                ws.cell(row, COL["Дата выдачи (оригинала)"]).value,
+            )
 
         start_year = parse_year(ws.cell(row, COL["Год поступления"]).value)
         end_year = parse_year(ws.cell(row, COL["Год окончания"]).value)
@@ -974,6 +997,32 @@ def scan_spo_workbook(path: Path, workbook=None) -> list[Issue]:
             check_regex(issues, path, ws, row, field, r"[А-ЯЁа-яёA-Z0-9()./\- ]+", "Недопустимые символы в регистрационном номере", sanitize_spo_registration)
         for field in ["Наименование профессии, специальности", "Наименование квалификации", "Наименование образовательной программы"]:
             check_regex(issues, path, ws, row, field, r"[А-ЯЁа-яёA-Z0-9()./\-:;, ]+", "Недопустимые символы в наименовании", sanitize_common_name)
+        if COL["Номер  договора о целевом обучении"] not in suppressed_cols:
+            check_regex(
+                issues,
+                path,
+                ws,
+                row,
+                "Номер  договора о целевом обучении",
+                r"[А-ЯЁа-яёA-Z0-9№()./\-_ ]+",
+                "Недопустимые символы в номере договора о целевом обучении",
+                sanitize_po_registration,
+            )
+        for field in [
+            "Наименование организации с которой заключён договор о целевом обучении",
+            "Наименование организации работодателя",
+        ]:
+            if COL[field] not in suppressed_cols:
+                check_regex(
+                    issues,
+                    path,
+                    ws,
+                    row,
+                    field,
+                    r"[А-ЯЁа-яёA-Z0-9№\"«»().,?:/\- &_#+;]+",
+                    "Недопустимые символы в наименовании организации",
+                    sanitize_po_program,
+                )
 
         snils_col = COL["СНИЛС"]
         snils = clean_text(ws.cell(row, snils_col).value)
@@ -1277,6 +1326,17 @@ def scan_po_workbook(path: Path, workbook=None) -> list[Issue]:
         if birth_date and not (date(1900, 1, 1) <= birth_date <= date(2100, 12, 31)):
             po_add_issue(issues, path, row, po_col("Дата рождения получателя"), "Дата рождения вне допустимого диапазона 1900-2100", ws.cell(row, po_col("Дата рождения получателя")).value)
 
+        original_issue_date = parse_date(ws.cell(row, po_col("Дата выдачи (оригинала)")).value)
+        if issue_date and original_issue_date and original_issue_date > issue_date:
+            po_add_issue(
+                issues,
+                path,
+                row,
+                po_col("Дата выдачи (оригинала)"),
+                "Дата выдачи оригинала позже даты выдачи дубликата",
+                ws.cell(row, po_col("Дата выдачи (оригинала)")).value,
+            )
+
         start_year = parse_year(ws.cell(row, po_col("Год начала обучения")).value)
         end_year = parse_year(ws.cell(row, po_col("Год окончания обучения")).value)
         min_start = 1955 if normalized_key(status) == normalized_key("Дубликат") else 1978
@@ -1344,9 +1404,20 @@ def scan_po_workbook(path: Path, workbook=None) -> list[Issue]:
                 if has_bad_edges_or_repeats(value):
                     po_add_issue(issues, path, row, col, "Пробел/дефис в начале или конце либо повтор пробелов/дефисов", value, clean_text(value).strip("- "))
 
-        for field in ["Серия документа", "Номер документа", "Серия (оригинала)", "Номер (оригинала)"]:
+        for field in ["Серия документа", "Номер документа", "Серия (оригинала)"]:
             if po_col(field) not in suppressed_cols:
                 po_check_regex(issues, path, ws, row, field, r"[А-ЯЁа-яёA-Z0-9 .\-/]+", "Недопустимые символы: разрешены кириллица, латиница, цифры, точка, дефис, пробел, слэш", sanitize_series)
+        if po_col("Номер (оригинала)") not in suppressed_cols:
+            po_check_regex(
+                issues,
+                path,
+                ws,
+                row,
+                "Номер (оригинала)",
+                r"\d+",
+                "Номер оригинала должен содержать только цифры",
+                sanitize_digits,
+            )
         for field in ["Регистрационный номер", "Регистрационный N (оригинала)"]:
             if po_col(field) not in suppressed_cols:
                 po_check_regex(issues, path, ws, row, field, r"[А-ЯЁа-яёA-Z0-9№()./\-_ ]+", "Недопустимые символы в регистрационном номере", sanitize_po_registration)
