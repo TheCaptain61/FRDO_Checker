@@ -1495,6 +1495,28 @@ def scan_workbook(path: Path) -> list[Issue]:
         workbook.close()
 
 
+def xlsx_files_for_scan(directory: Path) -> list[Path]:
+    skipped_dirs = {"_bak", "_merged"}
+    files = sorted(directory.rglob("*.xlsx"))
+    return [
+        path
+        for path in files
+        if not path.name.startswith("~$")
+        and not path.name.casefold().startswith("frdo_merged_")
+        and skipped_dirs.isdisjoint(part.casefold() for part in path.parts)
+    ]
+
+
+def profile_code_for_file(path: Path) -> str | None:
+    workbook = load_workbook(path, read_only=False, data_only=False)
+    try:
+        return detect_profile_from_workbook(workbook).code
+    except Exception:
+        return None
+    finally:
+        workbook.close()
+
+
 def backup_path_for(path: Path) -> Path:
     backup_dir = path.parent / "_bak"
     backup_dir.mkdir(parents=True, exist_ok=True)
@@ -1530,6 +1552,81 @@ def copy_row(ws, src_row: int, dst_row: int) -> None:
             dst.protection = copy.copy(src.protection)
         if src.comment:
             dst.comment = copy.copy(src.comment)
+
+
+def copy_cell_format(src, dst) -> None:
+    if src.has_style:
+        dst._style = copy.copy(src._style)
+    if src.number_format:
+        dst.number_format = src.number_format
+    if src.font:
+        dst.font = copy.copy(src.font)
+    if src.fill:
+        dst.fill = copy.copy(src.fill)
+    if src.border:
+        dst.border = copy.copy(src.border)
+    if src.alignment:
+        dst.alignment = copy.copy(src.alignment)
+    if src.protection:
+        dst.protection = copy.copy(src.protection)
+    if src.comment:
+        dst.comment = copy.copy(src.comment)
+
+
+def copy_row_between(src_ws, dst_ws, src_row: int, dst_row: int, max_col: int) -> None:
+    dst_ws.row_dimensions[dst_row].height = src_ws.row_dimensions[src_row].height
+    for col in range(1, max_col + 1):
+        src = src_ws.cell(src_row, col)
+        dst = dst_ws.cell(dst_row, col)
+        if is_formula(src.value):
+            dst.value = translate_formula(str(src.value), src_row, col, dst_row, col) or src.value
+        else:
+            dst.value = src.value
+        copy_cell_format(src, dst)
+
+
+def clear_template_data(ws, max_col: int, start_row: int = 2) -> None:
+    for row in range(start_row, ws.max_row + 1):
+        for col in range(1, max_col + 1):
+            ws.cell(row, col).value = None
+
+
+def merge_profile_workbooks(files: list[Path], profile: TemplateProfile, target: Path) -> int:
+    if not files:
+        raise ValueError("Нет файлов для объединения")
+
+    base_wb = load_workbook(files[0], read_only=False, data_only=False)
+    try:
+        if SHEET_NAME not in base_wb.sheetnames:
+            raise ValueError(f"В файле {files[0].name} нет листа '{SHEET_NAME}'")
+        dst_ws = base_wb[SHEET_NAME]
+        max_col = len(profile.headers)
+        has_data = row_has_data if profile.code == "spo" else po_row_has_data
+        clear_template_data(dst_ws, max_col)
+
+        dst_row = 2
+        rows_written = 0
+        for path in files:
+            src_wb = load_workbook(path, read_only=False, data_only=False)
+            try:
+                src_profile = detect_profile_from_workbook(src_wb)
+                if src_profile.code != profile.code or SHEET_NAME not in src_wb.sheetnames:
+                    continue
+                src_ws = src_wb[SHEET_NAME]
+                for src_row in range(2, src_ws.max_row + 1):
+                    if not has_data(src_ws, src_row):
+                        continue
+                    copy_row_between(src_ws, dst_ws, src_row, dst_row, max_col)
+                    dst_row += 1
+                    rows_written += 1
+            finally:
+                src_wb.close()
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        base_wb.save(target)
+        return rows_written
+    finally:
+        base_wb.close()
 
 
 def category_split_groups(issues: list[Issue]) -> list[tuple[int, int, tuple[str, ...]]]:
@@ -1997,6 +2094,7 @@ class CheckerApp(tk.Tk):
         self.directory = Path.cwd()
         self.issues: list[Issue] = []
         self.filtered_issues: list[Issue] = []
+        self.scanned_files: list[Path] = []
         self.sort_column: str | None = None
         self.sort_reverse = False
         self.status_var = tk.StringVar(value="Готово")
@@ -2055,6 +2153,7 @@ class CheckerApp(tk.Tk):
         ttk.Button(actions, text="Исправить в фильтре", command=self.fix_all).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(actions, text="Открыть ячейку", command=self.open_selected_cell).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(actions, text="Править ячейку", command=self.edit_selected_cell).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(actions, text="Объединить Excel", command=self.merge_valid_files).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(actions, text="Отчёт таблицы .doc", command=self.save_table_report).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(actions, text="Настройки правил", command=self.open_settings).pack(side=tk.LEFT, padx=(0, 6))
 
@@ -2271,13 +2370,14 @@ class CheckerApp(tk.Tk):
         self.tree.delete(*self.tree.get_children())
         self.issues = []
         self.filtered_issues = []
+        self.scanned_files = []
         if not self.directory.exists():
             messagebox.showerror(APP_TITLE, "Папка не найдена")
             return
         self.set_busy(True)
         try:
-            files = sorted(self.directory.rglob("*.xlsx"))
-            files = [path for path in files if not path.name.startswith("~$")]
+            files = xlsx_files_for_scan(self.directory)
+            self.scanned_files = files
             self.issues.extend(scan_files(files))
             if SETTINGS.check_duplicates:
                 self.issues.extend(duplicate_issues_for_files(files))
@@ -2286,6 +2386,87 @@ class CheckerApp(tk.Tk):
             self.apply_filters()
         finally:
             self.set_busy(False)
+
+    def scanned_files_by_profile(self) -> dict[str, list[Path]]:
+        files_by_profile: dict[str, list[Path]] = {"spo": [], "po": []}
+        for path in self.scanned_files:
+            try:
+                profile_code = profile_code_for_file(path)
+            except Exception:
+                profile_code = None
+            if profile_code in files_by_profile:
+                files_by_profile[profile_code].append(path)
+        return files_by_profile
+
+    def merge_valid_files(self) -> None:
+        if not self.scanned_files:
+            messagebox.showinfo(APP_TITLE, "Сначала выполните проверку файлов.")
+            return
+
+        files_by_profile = self.scanned_files_by_profile()
+        profiles_to_merge: list[tuple[str, TemplateProfile, list[Path]]] = []
+        skipped: list[str] = []
+        for code in ("spo", "po"):
+            profile = PROFILES[code]
+            files = files_by_profile[code]
+            if not files:
+                continue
+            blocking_count = sum(
+                1
+                for issue in self.issues
+                if issue.profile == profile.label and issue.severity == SEVERITY_BLOCKING
+            )
+            if blocking_count:
+                skipped.append(f"{profile.label}: есть блокирующие ошибки ({blocking_count})")
+                continue
+            profiles_to_merge.append((code, profile, files))
+
+        if not profiles_to_merge:
+            details = "\n".join(skipped) if skipped else "Нет файлов СПО или ПО для объединения."
+            messagebox.showwarning(APP_TITLE, f"Объединение недоступно.\n{details}")
+            return
+
+        plan_lines = [
+            f"{profile.label}: {len(files)} файл(ов) -> frdo_merged_{code}_*.xlsx"
+            for code, profile, files in profiles_to_merge
+        ]
+        if skipped:
+            plan_lines.append("")
+            plan_lines.extend(f"Пропущено: {line}" for line in skipped)
+        if not messagebox.askyesno(
+            APP_TITLE,
+            "Будут созданы отдельные объединённые Excel-файлы:\n\n"
+            + "\n".join(plan_lines)
+            + "\n\nИсходные файлы изменяться не будут.",
+        ):
+            return
+
+        default_output_dir = self.directory / "_merged"
+        default_output_dir.mkdir(parents=True, exist_ok=True)
+        output_dir = filedialog.askdirectory(
+            parent=self,
+            title="Папка для объединённых Excel-файлов",
+            initialdir=str(default_output_dir),
+        )
+        if not output_dir:
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        created: list[str] = []
+        self.set_busy(True)
+        try:
+            for code, profile, files in profiles_to_merge:
+                target = Path(output_dir) / f"frdo_merged_{code}_{timestamp}.xlsx"
+                rows = merge_profile_workbooks(files, profile, target)
+                created.append(f"{profile.label}: {rows} строк -> {target}")
+        except Exception as exc:
+            messagebox.showerror(APP_TITLE, f"Не удалось объединить файлы: {exc}")
+            traceback.print_exc()
+            return
+        finally:
+            self.set_busy(False)
+
+        messagebox.showinfo(APP_TITLE, "Объединение завершено:\n\n" + "\n".join(created))
 
     def selected_issues(self) -> list[Issue]:
         return [self.filtered_issues[int(item)] for item in self.tree.selection()]

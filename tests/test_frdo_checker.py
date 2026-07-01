@@ -311,6 +311,58 @@ class FrdoCheckerTests(unittest.TestCase):
             self.assertNotIn("<th>Подсказка</th>", content)
             self.assertNotIn("<th>Исправить на</th>", content)
 
+    def test_merge_spo_workbooks_copies_rows_and_translates_formulas(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = root / "spo_1.xlsx"
+            second = root / "spo_2.xlsx"
+            target = root / "merged.xlsx"
+
+            for path, doc_number in ((first, "1"), (second, "2")):
+                wb = Workbook()
+                ws = wb.active
+                ws.title = checker.SHEET_NAME
+                for col, header in enumerate(checker.EXPECTED_HEADERS, start=1):
+                    ws.cell(1, col).value = header
+                ws.cell(2, checker.COL["Серия документа"]).value = "Нет"
+                ws.cell(2, checker.COL["Номер документа"]).value = doc_number
+                ws.cell(2, checker.COL["Год поступления"]).value = 2020
+                ws.cell(2, checker.COL["Год окончания"]).value = 2024
+                ws.cell(2, checker.COL["Срок обучения, лет"]).value = "=Q2-P2"
+                wb.save(path)
+                wb.close()
+
+            rows = checker.merge_profile_workbooks([first, second], checker.PROFILES["spo"], target)
+
+            self.assertEqual(rows, 2)
+            loaded = checker.load_workbook(target, read_only=False, data_only=False)
+            try:
+                ws = loaded[checker.SHEET_NAME]
+                self.assertEqual(ws.cell(2, checker.COL["Номер документа"]).value, "1")
+                self.assertEqual(ws.cell(3, checker.COL["Номер документа"]).value, "2")
+                self.assertEqual(ws.cell(2, checker.COL["Срок обучения, лет"]).value, "=Q2-P2")
+                self.assertEqual(ws.cell(3, checker.COL["Срок обучения, лет"]).value, "=Q3-P3")
+            finally:
+                loaded.close()
+
+    def test_xlsx_scan_skips_generated_merge_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.xlsx"
+            generated_in_root = root / "frdo_merged_spo_20260701_120000.xlsx"
+            generated_dir = root / "_merged"
+            generated_dir.mkdir()
+            generated = generated_dir / "frdo_merged_spo.xlsx"
+            source.touch()
+            generated_in_root.touch()
+            generated.touch()
+
+            files = checker.xlsx_files_for_scan(root)
+
+            self.assertIn(source, files)
+            self.assertNotIn(generated_in_root, files)
+            self.assertNotIn(generated, files)
+
 
 if __name__ == "__main__":
     unittest.main()
