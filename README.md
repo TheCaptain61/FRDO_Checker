@@ -38,16 +38,6 @@ dist\FRDO_Checker.exe
 
 При первом запуске выберите папку с шаблонами, нажмите `Проверить`, затем просмотрите найденные проблемы. Автоматические исправления применяются только после подтверждения.
 
-## Screenshots
-
-### Main Interface
-
-![Main interface](docs/images/main-interface.png)
-
-### Fix Confirmation And Report
-
-![Fix confirmation and report](docs/images/fix-report-flow.png)
-
 ## Запуск Из Исходников
 
 ```powershell
@@ -102,6 +92,14 @@ python frdo_spo_checker.py --cli .
 - фильтры над таблицей;
 - таблица с цветовой подсветкой строк;
 - нижняя строка деталей с полным текстом выбранной проблемы.
+
+### Главное окно
+
+![Главное окно FRDO Checker](docs/images/main-interface.png)
+
+### Подтверждение исправлений и отчёт
+
+![Подтверждение исправлений и отчёт](docs/images/fix-report-flow.png)
 
 Двойной клик по строке или кнопка `Открыть ячейку` открывает файл Excel на листе `Шаблон` и выделяет проблемную ячейку.
 
