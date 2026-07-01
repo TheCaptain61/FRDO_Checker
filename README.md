@@ -38,6 +38,16 @@ dist\FRDO_Checker.exe
 
 При первом запуске выберите папку с шаблонами, нажмите `Проверить`, затем просмотрите найденные проблемы. Автоматические исправления применяются только после подтверждения.
 
+## Screenshots
+
+### Main Interface
+
+![Main interface](docs/images/main-interface.png)
+
+### Fix Confirmation And Report
+
+![Fix confirmation and report](docs/images/fix-report-flow.png)
+
 ## Запуск Из Исходников
 
 ```powershell
