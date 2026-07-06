@@ -113,6 +113,7 @@ ISSUE_FIXABLE = "Можно исправить"
 SEVERITY_BLOCKING = "Блокирующая"
 SEVERITY_WARNING = "Предупреждение"
 SEVERITY_AUTOFIX = "Автоисправление"
+DRIVER_CATEGORY_VALUES = {"C", "D", "E", "F"}
 
 
 SPO_VALIDATION_FIELDS = {
@@ -389,8 +390,11 @@ def valid_category_list(value: Any, allowed: list[Any]) -> tuple[bool, CategoryS
     if len(parts) < 2:
         return False, None
     allowed_keys = {normalized_key(v).upper() for v in allowed}
-    if all(part in allowed_keys for part in parts):
-        return True, CategorySplit(tuple(parts))
+    unique_parts = tuple(dict.fromkeys(parts))
+    if len(unique_parts) < 2:
+        return False, None
+    if all(part in allowed_keys for part in unique_parts) or all(part in DRIVER_CATEGORY_VALUES for part in unique_parts):
+        return True, CategorySplit(unique_parts)
     return False, None
 
 
@@ -941,6 +945,15 @@ def scan_spo_workbook(path: Path, workbook=None) -> list[Issue]:
                 add_issue(issues, path, row, COL["Год окончания"], f"Год окончания больше текущего года {CURRENT_YEAR}", end_year)
             if start_year and end_year < start_year:
                 add_issue(issues, path, row, COL["Год окончания"], "Год окончания меньше года поступления", end_year)
+            if issue_date and issue_date.year < end_year:
+                add_issue(
+                    issues,
+                    path,
+                    row,
+                    COL["Дата выдачи"],
+                    "Год даты выдачи меньше года окончания",
+                    ws.cell(row, COL["Дата выдачи"]).value,
+                )
         if start_year is not None and end_year is not None and end_year >= start_year:
             expected_term = end_year - start_year
             term_col = COL["Срок обучения, лет"]
@@ -1359,6 +1372,15 @@ def scan_po_workbook(path: Path, workbook=None) -> list[Issue]:
                 po_add_issue(issues, path, row, po_col("Год окончания обучения"), f"Год окончания больше текущего года {CURRENT_YEAR}", end_year)
             if start_year and end_year < start_year:
                 po_add_issue(issues, path, row, po_col("Год окончания обучения"), "Год окончания меньше года начала обучения", end_year)
+            if issue_date and issue_date.year < end_year:
+                po_add_issue(
+                    issues,
+                    path,
+                    row,
+                    po_col("Дата выдачи документа"),
+                    "Год даты выдачи меньше года окончания обучения",
+                    ws.cell(row, po_col("Дата выдачи документа")).value,
+                )
 
         hours_col = po_col("Срок обучения, часов")
         hours_raw = ws.cell(row, hours_col).value
@@ -1496,7 +1518,7 @@ def scan_workbook(path: Path) -> list[Issue]:
 
 
 def xlsx_files_for_scan(directory: Path) -> list[Path]:
-    skipped_dirs = {"_bak", "_merged"}
+    skipped_dirs = {"_bak", "_merged", "__merged"}
     files = sorted(directory.rglob("*.xlsx"))
     return [
         path
@@ -1536,27 +1558,10 @@ def copy_row(ws, src_row: int, dst_row: int) -> None:
         src = ws.cell(src_row, col)
         dst = ws.cell(dst_row, col)
         dst.value = src.value
-        if src.has_style:
-            dst._style = copy.copy(src._style)
-        if src.number_format:
-            dst.number_format = src.number_format
-        if src.font:
-            dst.font = copy.copy(src.font)
-        if src.fill:
-            dst.fill = copy.copy(src.fill)
-        if src.border:
-            dst.border = copy.copy(src.border)
-        if src.alignment:
-            dst.alignment = copy.copy(src.alignment)
-        if src.protection:
-            dst.protection = copy.copy(src.protection)
-        if src.comment:
-            dst.comment = copy.copy(src.comment)
+        copy_cell_format(src, dst)
 
 
 def copy_cell_format(src, dst) -> None:
-    if src.has_style:
-        dst._style = copy.copy(src._style)
     if src.number_format:
         dst.number_format = src.number_format
     if src.font:
@@ -1569,16 +1574,26 @@ def copy_cell_format(src, dst) -> None:
         dst.alignment = copy.copy(src.alignment)
     if src.protection:
         dst.protection = copy.copy(src.protection)
-    if src.comment:
-        dst.comment = copy.copy(src.comment)
 
 
-def copy_row_between(src_ws, dst_ws, src_row: int, dst_row: int, max_col: int) -> None:
+def calculated_merge_value(profile: TemplateProfile, src_ws, src_row: int, col: int) -> Any | None:
+    if profile.code == "spo" and col == COL["Срок обучения, лет"]:
+        start_year = parse_year(src_ws.cell(src_row, COL["Год поступления"]).value)
+        end_year = parse_year(src_ws.cell(src_row, COL["Год окончания"]).value)
+        if start_year is not None and end_year is not None and end_year >= start_year:
+            return end_year - start_year
+    return None
+
+
+def copy_row_between(src_ws, dst_ws, src_row: int, dst_row: int, max_col: int, profile: TemplateProfile) -> None:
     dst_ws.row_dimensions[dst_row].height = src_ws.row_dimensions[src_row].height
     for col in range(1, max_col + 1):
         src = src_ws.cell(src_row, col)
         dst = dst_ws.cell(dst_row, col)
-        if is_formula(src.value):
+        calculated = calculated_merge_value(profile, src_ws, src_row, col)
+        if calculated is not None:
+            dst.value = calculated
+        elif is_formula(src.value):
             dst.value = translate_formula(str(src.value), src_row, col, dst_row, col) or src.value
         else:
             dst.value = src.value
@@ -1616,7 +1631,7 @@ def merge_profile_workbooks(files: list[Path], profile: TemplateProfile, target:
                 for src_row in range(2, src_ws.max_row + 1):
                     if not has_data(src_ws, src_row):
                         continue
-                    copy_row_between(src_ws, dst_ws, src_row, dst_row, max_col)
+                    copy_row_between(src_ws, dst_ws, src_row, dst_row, max_col, profile)
                     dst_row += 1
                     rows_written += 1
             finally:
@@ -1627,6 +1642,15 @@ def merge_profile_workbooks(files: list[Path], profile: TemplateProfile, target:
         return rows_written
     finally:
         base_wb.close()
+
+
+def mergeable_files_for_profile(files: list[Path], profile: TemplateProfile, issues: list[Issue]) -> tuple[list[Path], dict[Path, int]]:
+    candidate_files = set(files)
+    blocking_by_file: dict[Path, int] = {}
+    for issue in issues:
+        if issue.file in candidate_files and issue.profile == profile.title and issue.severity == SEVERITY_BLOCKING:
+            blocking_by_file[issue.file] = blocking_by_file.get(issue.file, 0) + 1
+    return [path for path in files if path not in blocking_by_file], blocking_by_file
 
 
 def category_split_groups(issues: list[Issue]) -> list[tuple[int, int, tuple[str, ...]]]:
@@ -2411,34 +2435,25 @@ class CheckerApp(tk.Tk):
             files = files_by_profile[code]
             if not files:
                 continue
-            blocking_count = sum(
-                1
-                for issue in self.issues
-                if issue.profile == profile.label and issue.severity == SEVERITY_BLOCKING
-            )
-            if blocking_count:
-                skipped.append(f"{profile.label}: есть блокирующие ошибки ({blocking_count})")
-                continue
-            profiles_to_merge.append((code, profile, files))
+            merge_files, blocking_by_file = mergeable_files_for_profile(files, profile, self.issues)
+            if blocking_by_file:
+                skipped.append(
+                    f"{profile.title}: пропущено {len(blocking_by_file)} файл(ов) "
+                    f"с блокирующими ошибками ({sum(blocking_by_file.values())})"
+                )
+            if merge_files:
+                profiles_to_merge.append((code, profile, merge_files))
 
         if not profiles_to_merge:
             details = "\n".join(skipped) if skipped else "Нет файлов СПО или ПО для объединения."
             messagebox.showwarning(APP_TITLE, f"Объединение недоступно.\n{details}")
             return
 
-        plan_lines = [
-            f"{profile.label}: {len(files)} файл(ов) -> frdo_merged_{code}_*.xlsx"
-            for code, profile, files in profiles_to_merge
-        ]
-        if skipped:
-            plan_lines.append("")
-            plan_lines.extend(f"Пропущено: {line}" for line in skipped)
-        if not messagebox.askyesno(
-            APP_TITLE,
-            "Будут созданы отдельные объединённые Excel-файлы:\n\n"
-            + "\n".join(plan_lines)
-            + "\n\nИсходные файлы изменяться не будут.",
-        ):
+        selected_profiles = self.choose_files_for_merge(profiles_to_merge, skipped)
+        if selected_profiles is None:
+            return
+        if not selected_profiles:
+            messagebox.showinfo(APP_TITLE, "Не выбран ни один файл для объединения.")
             return
 
         default_output_dir = self.directory / "_merged"
@@ -2455,10 +2470,10 @@ class CheckerApp(tk.Tk):
         created: list[str] = []
         self.set_busy(True)
         try:
-            for code, profile, files in profiles_to_merge:
+            for code, profile, files in selected_profiles:
                 target = Path(output_dir) / f"frdo_merged_{code}_{timestamp}.xlsx"
                 rows = merge_profile_workbooks(files, profile, target)
-                created.append(f"{profile.label}: {rows} строк -> {target}")
+                created.append(f"{profile.title}: {rows} строк -> {target}")
         except Exception as exc:
             messagebox.showerror(APP_TITLE, f"Не удалось объединить файлы: {exc}")
             traceback.print_exc()
@@ -2467,6 +2482,84 @@ class CheckerApp(tk.Tk):
             self.set_busy(False)
 
         messagebox.showinfo(APP_TITLE, "Объединение завершено:\n\n" + "\n".join(created))
+
+    def choose_files_for_merge(
+        self,
+        profiles_to_merge: list[tuple[str, TemplateProfile, list[Path]]],
+        skipped: list[str],
+    ) -> list[tuple[str, TemplateProfile, list[Path]]] | None:
+        dialog = tk.Toplevel(self)
+        dialog.title("Выбор файлов для объединения")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.geometry("760x520")
+        dialog.minsize(620, 380)
+
+        ttk.Label(
+            dialog,
+            text="Выберите Excel-файлы для объединения. Предупреждения не блокируют объединение.",
+            padding=10,
+        ).pack(fill=tk.X)
+
+        outer = ttk.Frame(dialog, padding=(10, 0, 10, 10))
+        outer.pack(fill=tk.BOTH, expand=True)
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(outer, orient=tk.VERTICAL, command=canvas.yview)
+        content = ttk.Frame(canvas)
+        content.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=content, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        vars_by_file: dict[tuple[str, Path], tk.BooleanVar] = {}
+        issues_by_file: dict[Path, list[Issue]] = {}
+        for issue in self.issues:
+            issues_by_file.setdefault(issue.file, []).append(issue)
+
+        for code, profile, files in profiles_to_merge:
+            ttk.Label(content, text=f"{profile.title}", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(8, 2))
+            for path in sorted(files, key=lambda item: self.relative_file(item).casefold()):
+                var = tk.BooleanVar(value=True)
+                vars_by_file[(code, path)] = var
+                file_issues = issues_by_file.get(path, [])
+                warnings = sum(1 for issue in file_issues if issue.severity == SEVERITY_WARNING)
+                fixable = sum(1 for issue in file_issues if issue.severity == SEVERITY_AUTOFIX)
+                ttk.Checkbutton(content, text=self.relative_file(path), variable=var).pack(anchor="w", pady=(4, 0))
+                details = f"Предупреждений: {warnings}; автоисправлений: {fixable}"
+                ttk.Label(content, text=details, foreground="#555555").pack(anchor="w", padx=(24, 0))
+
+        if skipped:
+            ttk.Label(content, text="Пропущено автоматически", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(14, 2))
+            for line in skipped:
+                ttk.Label(content, text=line, foreground="#8a4b00", wraplength=680).pack(anchor="w", padx=(24, 0))
+
+        result: dict[str, Any] = {"profiles": None}
+        buttons = ttk.Frame(dialog, padding=10)
+        buttons.pack(fill=tk.X)
+
+        def select_all(value: bool) -> None:
+            for var in vars_by_file.values():
+                var.set(value)
+
+        def ok() -> None:
+            selected: list[tuple[str, TemplateProfile, list[Path]]] = []
+            for code, profile, files in profiles_to_merge:
+                selected_files = [path for path in files if vars_by_file[(code, path)].get()]
+                if selected_files:
+                    selected.append((code, profile, selected_files))
+            result["profiles"] = selected
+            dialog.destroy()
+
+        def cancel() -> None:
+            dialog.destroy()
+
+        ttk.Button(buttons, text="Все", command=lambda: select_all(True)).pack(side=tk.LEFT)
+        ttk.Button(buttons, text="Снять все", command=lambda: select_all(False)).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(buttons, text="Отмена", command=cancel).pack(side=tk.RIGHT)
+        ttk.Button(buttons, text="Объединить выбранные", command=ok, style="Accent.TButton").pack(side=tk.RIGHT, padx=(0, 6))
+        self.wait_window(dialog)
+        return result["profiles"]
 
     def selected_issues(self) -> list[Issue]:
         return [self.filtered_issues[int(item)] for item in self.tree.selection()]
@@ -2778,7 +2871,7 @@ class CheckerApp(tk.Tk):
 
 
 def cli_scan(directory: Path) -> int:
-    files = [path for path in sorted(directory.rglob("*.xlsx")) if not path.name.startswith("~$")]
+    files = xlsx_files_for_scan(directory)
     issues = scan_files(files)
     if SETTINGS.check_duplicates:
         issues.extend(duplicate_issues_for_files(files))

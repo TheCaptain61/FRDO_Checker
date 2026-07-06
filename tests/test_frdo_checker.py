@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
 from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill
 from openpyxl.worksheet.datavalidation import DataValidation
 
 import frdo_spo_checker as checker
@@ -69,6 +72,62 @@ class FrdoCheckerTests(unittest.TestCase):
 
         self.assertEqual([ws.cell(row, category_col).value for row in range(2, 8)], ["C", "C", "D", "D", "E", "E"])
         self.assertEqual([ws.cell(row, 1).value for row in range(2, 8)], ["row-2", "row-3", "row-2", "row-3", "row-2", "row-3"])
+
+    def test_category_split_accepts_any_driver_category_combination(self) -> None:
+        for raw, expected in {
+            "C,E,F": ("C", "E", "F"),
+            "C,F,D": ("C", "F", "D"),
+            "E; D": ("E", "D"),
+        }.items():
+            with self.subTest(raw=raw):
+                ok, split = checker.valid_category_list(raw, [])
+
+                self.assertTrue(ok)
+                self.assertEqual(split, checker.CategorySplit(expected))
+
+    def test_category_split_preserves_valid_style_references(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "po.xlsx"
+            wb = Workbook()
+            ws = wb.active
+            ws.title = checker.SHEET_NAME
+            for col, header in enumerate(checker.PO_HEADERS, start=1):
+                ws.cell(1, col).value = header
+            category_col = checker.po_col("Присвоенный квалификационный разряд, класс, категория (при наличии)")
+            styled_cell = ws.cell(2, checker.po_col("Номер документа"))
+            styled_cell.value = "1"
+            styled_cell.font = Font(name="Arial", bold=True, color="FF000100")
+            styled_cell.fill = PatternFill("solid", fgColor="FFFF0100")
+            ws.cell(2, checker.po_col("Серия документа")).value = "Нет"
+            ws.cell(2, category_col).value = "C,E,F"
+            wb.save(path)
+            wb.close()
+
+            checker.apply_fixes([
+                checker.Issue(
+                    path,
+                    2,
+                    category_col,
+                    "Категория",
+                    "split",
+                    "C,E,F",
+                    checker.CategorySplit(("C", "E", "F")),
+                    "ПО",
+                )
+            ])
+
+            with zipfile.ZipFile(path) as archive:
+                styles_xml = archive.read("xl/styles.xml")
+                sheet_xml = archive.read("xl/worksheets/sheet1.xml")
+            ns = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+            styles_root = ET.fromstring(styles_xml)
+            sheet_root = ET.fromstring(sheet_xml)
+            cell_xfs = styles_root.find("main:cellXfs", ns)
+            self.assertIsNotNone(cell_xfs)
+            style_count = int(cell_xfs.attrib["count"])
+            style_ids = [int(cell.attrib["s"]) for cell in sheet_root.findall(".//main:c[@s]", ns)]
+            self.assertTrue(style_ids)
+            self.assertLess(max(style_ids), style_count)
 
     def test_formula_and_protection_checks(self) -> None:
         wb = Workbook()
@@ -161,6 +220,25 @@ class FrdoCheckerTests(unittest.TestCase):
         self.assertIn("Недопустимые символы в номере договора о целевом обучении", messages)
         self.assertIn("Недопустимые символы в наименовании организации", messages)
 
+    def test_spo_issue_date_year_must_not_be_before_graduation_year(self) -> None:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = checker.SHEET_NAME
+        for col, header in enumerate(checker.EXPECTED_HEADERS, start=1):
+            ws.cell(1, col).value = header
+        ws.cell(2, checker.COL["Серия документа"]).value = "Нет"
+        ws.cell(2, checker.COL["Номер документа"]).value = "1"
+        ws.cell(2, checker.COL["Дата выдачи"]).value = "01.06.2023"
+        ws.cell(2, checker.COL["Год поступления"]).value = 2020
+        ws.cell(2, checker.COL["Год окончания"]).value = 2024
+        ws.cell(2, checker.COL["Срок обучения, лет"]).value = 4
+
+        issues = checker.scan_spo_workbook(Path("sample.xlsx"), wb)
+        issue = next(item for item in issues if item.message == "Год даты выдачи меньше года окончания")
+
+        self.assertEqual(issue.col, checker.COL["Дата выдачи"])
+        self.assertEqual(issue.severity, checker.SEVERITY_BLOCKING)
+
     def test_po_extra_matrix_rules_for_original_document(self) -> None:
         wb = Workbook()
         ws = wb.active
@@ -181,6 +259,25 @@ class FrdoCheckerTests(unittest.TestCase):
 
         self.assertIn("Номер оригинала должен содержать только цифры", messages)
         self.assertIn("Дата выдачи оригинала позже даты выдачи дубликата", messages)
+
+    def test_po_issue_date_year_must_not_be_before_graduation_year(self) -> None:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = checker.SHEET_NAME
+        for col, header in enumerate(checker.PO_HEADERS, start=1):
+            ws.cell(1, col).value = header
+        ws.cell(2, checker.po_col("Серия документа")).value = "Нет"
+        ws.cell(2, checker.po_col("Номер документа")).value = "1"
+        ws.cell(2, checker.po_col("Дата выдачи документа")).value = "01.06.2023"
+        ws.cell(2, checker.po_col("Год начала обучения")).value = 2020
+        ws.cell(2, checker.po_col("Год окончания обучения")).value = 2024
+        ws.cell(2, checker.po_col("Срок обучения, часов")).value = 72
+
+        issues = checker.scan_po_workbook(Path("sample.xlsx"), wb)
+        issue = next(item for item in issues if item.message == "Год даты выдачи меньше года окончания обучения")
+
+        self.assertEqual(issue.col, checker.po_col("Дата выдачи документа"))
+        self.assertEqual(issue.severity, checker.SEVERITY_BLOCKING)
 
     def test_manual_edit_creates_backup_and_writes_value(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -311,7 +408,7 @@ class FrdoCheckerTests(unittest.TestCase):
             self.assertNotIn("<th>Подсказка</th>", content)
             self.assertNotIn("<th>Исправить на</th>", content)
 
-    def test_merge_spo_workbooks_copies_rows_and_translates_formulas(self) -> None:
+    def test_merge_spo_workbooks_copies_rows_and_writes_calculated_term(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             first = root / "spo_1.xlsx"
@@ -340,10 +437,79 @@ class FrdoCheckerTests(unittest.TestCase):
                 ws = loaded[checker.SHEET_NAME]
                 self.assertEqual(ws.cell(2, checker.COL["Номер документа"]).value, "1")
                 self.assertEqual(ws.cell(3, checker.COL["Номер документа"]).value, "2")
-                self.assertEqual(ws.cell(2, checker.COL["Срок обучения, лет"]).value, "=Q2-P2")
-                self.assertEqual(ws.cell(3, checker.COL["Срок обучения, лет"]).value, "=Q3-P3")
+                self.assertEqual(ws.cell(2, checker.COL["Срок обучения, лет"]).value, 4)
+                self.assertEqual(ws.cell(3, checker.COL["Срок обучения, лет"]).value, 4)
             finally:
                 loaded.close()
+
+    def test_merge_workbooks_keeps_style_references_valid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = root / "spo_1.xlsx"
+            second = root / "spo_2.xlsx"
+            target = root / "merged.xlsx"
+
+            for index, path in enumerate((first, second), start=1):
+                wb = Workbook()
+                ws = wb.active
+                ws.title = checker.SHEET_NAME
+                for col, header in enumerate(checker.EXPECTED_HEADERS, start=1):
+                    ws.cell(1, col).value = header
+                cell = ws.cell(2, checker.COL["Номер документа"])
+                cell.value = str(index)
+                cell.font = Font(name="Arial", bold=True, color=f"FF000{index}00")
+                cell.fill = PatternFill("solid", fgColor=f"FFFF0{index}00")
+                ws.cell(2, checker.COL["Серия документа"]).value = "Нет"
+                ws.cell(2, checker.COL["Год поступления"]).value = 2020
+                ws.cell(2, checker.COL["Год окончания"]).value = 2024
+                wb.save(path)
+                wb.close()
+
+            checker.merge_profile_workbooks([first, second], checker.PROFILES["spo"], target)
+
+            with zipfile.ZipFile(target) as archive:
+                styles_xml = archive.read("xl/styles.xml")
+                sheet_xml = archive.read("xl/worksheets/sheet1.xml")
+            ns = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+            styles_root = ET.fromstring(styles_xml)
+            sheet_root = ET.fromstring(sheet_xml)
+            cell_xfs = styles_root.find("main:cellXfs", ns)
+            self.assertIsNotNone(cell_xfs)
+            style_count = int(cell_xfs.attrib["count"])
+            style_ids = [
+                int(cell.attrib["s"])
+                for cell in sheet_root.findall(".//main:c[@s]", ns)
+            ]
+            self.assertTrue(style_ids)
+            self.assertLess(max(style_ids), style_count)
+
+    def test_mergeable_files_for_profile_skips_only_blocking_files(self) -> None:
+        clean = Path("clean.xlsx")
+        blocked = Path("blocked.xlsx")
+        files = [clean, blocked]
+        issues = [
+            checker.Issue(
+                clean,
+                1,
+                checker.COL["Срок обучения, лет"],
+                "Срок обучения, лет",
+                "Подозрительная ширина колонки: 100",
+                profile="СПО",
+            ),
+            checker.Issue(
+                blocked,
+                2,
+                checker.COL["Номер документа"],
+                "Номер документа",
+                "Обязательное поле не заполнено",
+                profile="СПО",
+            )
+        ]
+
+        merge_files, blocking_by_file = checker.mergeable_files_for_profile(files, checker.PROFILES["spo"], issues)
+
+        self.assertEqual(merge_files, [clean])
+        self.assertEqual(blocking_by_file, {blocked: 1})
 
     def test_xlsx_scan_skips_generated_merge_folder(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -353,15 +519,20 @@ class FrdoCheckerTests(unittest.TestCase):
             generated_dir = root / "_merged"
             generated_dir.mkdir()
             generated = generated_dir / "frdo_merged_spo.xlsx"
+            generated_double_dir = root / "__merged"
+            generated_double_dir.mkdir()
+            generated_double = generated_double_dir / "manual_merged.xlsx"
             source.touch()
             generated_in_root.touch()
             generated.touch()
+            generated_double.touch()
 
             files = checker.xlsx_files_for_scan(root)
 
             self.assertIn(source, files)
             self.assertNotIn(generated_in_root, files)
             self.assertNotIn(generated, files)
+            self.assertNotIn(generated_double, files)
 
 
 if __name__ == "__main__":
