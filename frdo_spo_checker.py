@@ -261,14 +261,6 @@ class TemplateProfile:
     scanner: Callable[[Path, Any], list[Issue]]
 
 
-@dataclass(frozen=True)
-class CategorySplit:
-    parts: tuple[str, ...]
-
-    def __str__(self) -> str:
-        return "разделить на строки: " + ", ".join(self.parts)
-
-
 def is_blank(value: Any) -> bool:
     return value is None or (isinstance(value, str) and value.strip() == "")
 
@@ -385,31 +377,22 @@ def parse_category_list(value: Any) -> list[str]:
     return [part.strip() for part in re.split(r"[,;]+", raw) if part.strip()]
 
 
-def valid_category_list(value: Any, allowed: list[Any]) -> tuple[bool, CategorySplit | None]:
+def category_list_replacement(value: Any, allowed: list[Any]) -> tuple[bool, Any | None]:
     parts = parse_category_list(value)
     if len(parts) < 2:
         return False, None
-    allowed_keys = {normalized_key(v).upper() for v in allowed}
+    allowed_keys = {normalized_key(v).upper(): v for v in allowed}
     unique_parts = tuple(dict.fromkeys(parts))
     if len(unique_parts) < 2:
         return False, None
-    if all(part in allowed_keys for part in unique_parts) or all(part in DRIVER_CATEGORY_VALUES for part in unique_parts):
-        return True, CategorySplit(unique_parts)
+    compact_key = "".join(unique_parts)
+    if compact_key in allowed_keys:
+        return True, allowed_keys[compact_key]
+    if allowed_keys and all(part in allowed_keys for part in unique_parts):
+        return True, None
+    if all(part in DRIVER_CATEGORY_VALUES for part in unique_parts):
+        return True, None
     return False, None
-
-
-def split_category_list(value: Any, allowed: list[Any]) -> tuple[bool, str | None, str | None]:
-    parts = parse_category_list(value)
-    if len(parts) < 2 or "D" not in parts:
-        return False, None, None
-    allowed_keys = {normalized_key(v).upper() for v in allowed}
-    unique_parts = list(dict.fromkeys(parts))
-    if not all(part in allowed_keys for part in unique_parts):
-        return False, None, None
-    keep_parts = [part for part in unique_parts if part != "D"]
-    if not keep_parts:
-        return False, None, None
-    return True, ", ".join(keep_parts), "D"
 
 
 def valid_chars(pattern: str, value: Any) -> bool:
@@ -1124,24 +1107,6 @@ def po_add_issue(issues: list[Issue], file: Path, row: int, col: int, message: s
     issues.append(Issue(file, row, col, field, message, current, proposed, "ПО"))
 
 
-def po_add_split_issue(issues: list[Issue], file: Path, row: int, col: int, current: Any, keep_value: str, duplicate_value: str) -> None:
-    field = PO_HEADERS[col - 1] if col else ""
-    issues.append(
-        Issue(
-            file,
-            row,
-            col,
-            field,
-            "Строка будет разделена по категориям: исходная строка + строка-дубликат",
-            current,
-            f"{keep_value}; новая строка: {duplicate_value}",
-            "ПО",
-            "split_row",
-            {"keep_value": keep_value, "duplicate_value": duplicate_value},
-        )
-    )
-
-
 def po_check_required(issues: list[Issue], file: Path, ws, row: int, field: str) -> None:
     col = po_col(field)
     if is_blank(ws.cell(row, col).value):
@@ -1309,9 +1274,18 @@ def scan_po_workbook(path: Path, workbook=None) -> list[Issue]:
             if col in suppressed_cols:
                 continue
             if field == "Присвоенный квалификационный разряд, класс, категория (при наличии)":
-                is_category_list, split_categories = valid_category_list(ws.cell(row, col).value, allowed)
-                if is_category_list:
-                    po_add_issue(issues, path, row, col, "Список категорий должен быть разделён на отдельные строки", ws.cell(row, col).value, proposed_if_enabled(split_categories, "autofix_category_split"))
+                has_category_list, replacement = category_list_replacement(ws.cell(row, col).value, allowed)
+                if has_category_list:
+                    proposed = proposed_if_enabled(replacement, "autofix_category_split") if replacement is not None else None
+                    po_add_issue(
+                        issues,
+                        path,
+                        row,
+                        col,
+                        "Значение отсутствует в справочнике: выберите одно значение категории из выпадающего списка",
+                        ws.cell(row, col).value,
+                        proposed,
+                    )
                     continue
             ok, proposed = list_match(ws.cell(row, col).value, allowed)
             if proposed is not None:
@@ -1653,38 +1627,6 @@ def mergeable_files_for_profile(files: list[Path], profile: TemplateProfile, iss
     return [path for path in files if path not in blocking_by_file], blocking_by_file
 
 
-def category_split_groups(issues: list[Issue]) -> list[tuple[int, int, tuple[str, ...]]]:
-    split_issues = sorted(
-        (issue for issue in issues if isinstance(issue.proposed, CategorySplit)),
-        key=lambda issue: issue.row,
-    )
-    groups: list[tuple[int, int, tuple[str, ...]]] = []
-    for issue in split_issues:
-        parts = issue.proposed.parts
-        if groups and groups[-1][1] + 1 == issue.row and groups[-1][2] == parts:
-            start, _end, old_parts = groups[-1]
-            groups[-1] = (start, issue.row, old_parts)
-        else:
-            groups.append((issue.row, issue.row, parts))
-    return groups
-
-
-def apply_category_splits(ws, issues: list[Issue]) -> None:
-    category_col = po_col("Присвоенный квалификационный разряд, класс, категория (при наличии)")
-    for start_row, end_row, parts in reversed(category_split_groups(issues)):
-        row_count = end_row - start_row + 1
-        for row in range(start_row, end_row + 1):
-            ws.cell(row, category_col).value = parts[0]
-        for category in reversed(parts[1:]):
-            insert_at = end_row + 1
-            ws.insert_rows(insert_at, row_count)
-            for offset in range(row_count):
-                src_row = start_row + offset
-                dst_row = insert_at + offset
-                copy_row(ws, src_row, dst_row)
-                ws.cell(dst_row, category_col).value = category
-
-
 def apply_fixes(issues: list[Issue]) -> dict[Path, int]:
     by_file: dict[Path, list[Issue]] = {}
     for issue in issues:
@@ -1696,8 +1638,7 @@ def apply_fixes(issues: list[Issue]) -> dict[Path, int]:
         make_backup(path)
         workbook = load_workbook(path, read_only=False, data_only=False)
         ws = workbook[SHEET_NAME]
-        normal_issues = [issue for issue in file_issues if issue.action == "cell" and not isinstance(issue.proposed, CategorySplit)]
-        split_issues = [issue for issue in file_issues if isinstance(issue.proposed, CategorySplit)]
+        normal_issues = [issue for issue in file_issues if issue.action == "cell"]
         protect_issues = [issue for issue in file_issues if issue.action == "protect_sheet"]
         unhide_issues = [issue for issue in file_issues if issue.action == "unhide_column"]
         for issue in normal_issues:
@@ -1713,8 +1654,6 @@ def apply_fixes(issues: list[Issue]) -> dict[Path, int]:
             ws.protection.sheet = True
         for issue in unhide_issues:
             ws.column_dimensions[get_column_letter(issue.col)].hidden = False
-        if split_issues:
-            apply_category_splits(ws, split_issues)
         workbook.save(path)
         workbook.close()
         saved[path] = len(file_issues)
@@ -2715,7 +2654,7 @@ class CheckerApp(tk.Tk):
             "autofix_snils_format": "Автоформатировать корректный СНИЛС",
             "autofix_invalid_chars": "Автоисправлять безопасно заменяемые недопустимые символы",
             "autofix_conditional_cleanup": "Автоочищать поля, запрещенные условиями",
-            "autofix_category_split": "Авторазделять списки категорий C, D, E, F на строки",
+            "autofix_category_split": "Автозаменять список категорий на одно значение справочника",
         }
 
         frame = ttk.Frame(dialog, padding=(10, 0, 10, 10))

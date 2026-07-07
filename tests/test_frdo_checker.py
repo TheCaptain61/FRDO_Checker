@@ -53,7 +53,78 @@ class FrdoCheckerTests(unittest.TestCase):
         self.assertEqual(len(issues), 1)
         self.assertIsNone(issues[0].proposed)
 
-    def test_category_split_copies_rows_by_blocks(self) -> None:
+    def test_category_list_replacement_uses_single_reference_value(self) -> None:
+        for raw, allowed, expected in (
+            ("C,E", ["CE"], "CE"),
+            ("D1,E", ["D1E"], "D1E"),
+            ("c; e", ["CE"], "CE"),
+        ):
+            with self.subTest(raw=raw):
+                ok, replacement = checker.category_list_replacement(raw, allowed)
+
+                self.assertTrue(ok)
+                self.assertEqual(replacement, expected)
+
+    def test_category_list_replacement_blocks_manual_driver_combinations(self) -> None:
+        ok, replacement = checker.category_list_replacement("C,D,E,F", ["C", "D", "E", "F", "CE", "DE"])
+
+        self.assertTrue(ok)
+        self.assertIsNone(replacement)
+
+        issue = checker.Issue(
+            Path("po.xlsx"),
+            2,
+            checker.po_col("Присвоенный квалификационный разряд, класс, категория (при наличии)"),
+            "Категория",
+            "Значение отсутствует в справочнике: выберите одно значение категории из выпадающего списка",
+            "C,D,E,F",
+            None,
+            "ПО",
+        )
+        self.assertEqual(issue.severity, checker.SEVERITY_BLOCKING)
+
+    def test_category_list_replacement_blocks_multiple_allowed_values(self) -> None:
+        ok, replacement = checker.category_list_replacement("A,B", ["A", "B", "C"])
+
+        self.assertTrue(ok)
+        self.assertIsNone(replacement)
+
+    def test_category_autofix_replaces_value_without_inserting_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "po.xlsx"
+            wb = Workbook()
+            ws = wb.active
+            ws.title = checker.SHEET_NAME
+            for col, header in enumerate(checker.PO_HEADERS, start=1):
+                ws.cell(1, col).value = header
+            category_col = checker.po_col("Присвоенный квалификационный разряд, класс, категория (при наличии)")
+            ws.cell(2, 1).value = "row-2"
+            ws.cell(2, category_col).value = "C,E"
+            wb.save(path)
+            wb.close()
+
+            checker.apply_fixes([
+                checker.Issue(
+                    path,
+                    2,
+                    category_col,
+                    "Категория",
+                    "Значение отсутствует в справочнике: выберите одно значение категории из выпадающего списка",
+                    "C,E",
+                    "CE",
+                    "ПО",
+                )
+            ])
+
+            wb = checker.load_workbook(path, read_only=False, data_only=False)
+            try:
+                ws = wb[checker.SHEET_NAME]
+                self.assertEqual(ws.cell(2, category_col).value, "CE")
+                self.assertEqual(ws.max_row, 2)
+            finally:
+                wb.close()
+
+    def test_copy_row_preserves_valid_style_references(self) -> None:
         wb = Workbook()
         ws = wb.active
         for col, header in enumerate(checker.PO_HEADERS, start=1):
@@ -61,31 +132,14 @@ class FrdoCheckerTests(unittest.TestCase):
         category_col = checker.po_col("Присвоенный квалификационный разряд, класс, категория (при наличии)")
         ws.cell(2, 1).value = "row-2"
         ws.cell(3, 1).value = "row-3"
-        ws.cell(2, category_col).value = "C,D,E"
-        ws.cell(3, category_col).value = "C,D,E"
-        issues = [
-            checker.Issue(Path("po.xlsx"), 2, category_col, "Категория", "split", "C,D,E", checker.CategorySplit(("C", "D", "E")), "ПО"),
-            checker.Issue(Path("po.xlsx"), 3, category_col, "Категория", "split", "C,D,E", checker.CategorySplit(("C", "D", "E")), "ПО"),
-        ]
+        ws.cell(2, category_col).value = "C"
+        ws.cell(3, category_col).value = "D"
+        checker.copy_row(ws, 2, 4)
 
-        checker.apply_category_splits(ws, issues)
+        self.assertEqual(ws.cell(4, 1).value, "row-2")
+        self.assertEqual(ws.cell(4, category_col).value, "C")
 
-        self.assertEqual([ws.cell(row, category_col).value for row in range(2, 8)], ["C", "C", "D", "D", "E", "E"])
-        self.assertEqual([ws.cell(row, 1).value for row in range(2, 8)], ["row-2", "row-3", "row-2", "row-3", "row-2", "row-3"])
-
-    def test_category_split_accepts_any_driver_category_combination(self) -> None:
-        for raw, expected in {
-            "C,E,F": ("C", "E", "F"),
-            "C,F,D": ("C", "F", "D"),
-            "E; D": ("E", "D"),
-        }.items():
-            with self.subTest(raw=raw):
-                ok, split = checker.valid_category_list(raw, [])
-
-                self.assertTrue(ok)
-                self.assertEqual(split, checker.CategorySplit(expected))
-
-    def test_category_split_preserves_valid_style_references(self) -> None:
+    def test_apply_fixes_preserves_valid_style_references(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "po.xlsx"
             wb = Workbook()
@@ -99,7 +153,7 @@ class FrdoCheckerTests(unittest.TestCase):
             styled_cell.font = Font(name="Arial", bold=True, color="FF000100")
             styled_cell.fill = PatternFill("solid", fgColor="FFFF0100")
             ws.cell(2, checker.po_col("Серия документа")).value = "Нет"
-            ws.cell(2, category_col).value = "C,E,F"
+            ws.cell(2, category_col).value = "C,E"
             wb.save(path)
             wb.close()
 
@@ -109,9 +163,9 @@ class FrdoCheckerTests(unittest.TestCase):
                     2,
                     category_col,
                     "Категория",
-                    "split",
-                    "C,E,F",
-                    checker.CategorySplit(("C", "E", "F")),
+                    "Значение отсутствует в справочнике: выберите одно значение категории из выпадающего списка",
+                    "C,E",
+                    "CE",
                     "ПО",
                 )
             ])
